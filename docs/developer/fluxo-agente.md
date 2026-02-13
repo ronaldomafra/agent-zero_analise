@@ -1,152 +1,123 @@
 # Fluxo detalhado de funcionamento do agente (Agent Zero)
 
-Este documento descreve, ponta a ponta, como o Agent Zero processa uma mensagem: da entrada via API/UI, passando por contexto, montagem de prompt, execução de ferramentas/extensões, até a resposta final e persistência.
+Este documento descreve, ponta a ponta, como o Agent Zero processa uma
+mensagem: da entrada via API/UI, passando por contexto, montagem de
+prompt, execução de ferramentas/extensões, até a resposta final e
+persistência.
+
+------------------------------------------------------------------------
 
 ## 1) Bootstrap e inicialização do runtime
 
-O runtime web é iniciado em `run_ui.py`, que configura:
+O runtime web é iniciado em `run_ui.py`, responsável por:
 
-- servidor Flask para HTTP/UI;
-- servidor Socket.IO/ASGI para eventos em tempo real;
-- middlewares de autenticação, CSRF e validação de origem;
-- descoberta dinâmica de namespaces WebSocket e handlers.
+-   inicializar servidor Flask (HTTP/UI);
+-   subir servidor Socket.IO / ASGI para eventos em tempo real;
+-   configurar middlewares (autenticação, CSRF, validação de origem);
+-   registrar dinamicamente namespaces e handlers WebSocket.
 
-Em paralelo, a configuração do agente é construída por `initialize.initialize_agent()`, que:
+Em paralelo, a configuração do agente é construída por
+`initialize.initialize_agent()`, que:
 
-1. carrega settings atuais;
-2. monta `ModelConfig` para chat, utilitário, embedding e browser;
-3. compõe `AgentConfig` (perfil, memória, knowledge, MCP, browser headers etc.);
-4. aplica parâmetros de runtime (incluindo execução remota/SSH quando configurada).
+1.  carrega as configurações atuais (settings);
+2.  monta `ModelConfig` (chat, modelo utilitário, embedding e browser);
+3.  compõe `AgentConfig` (perfil, memória, knowledge, MCP, browser
+    headers etc.);
+4.  aplica parâmetros de runtime (incluindo execução remota/SSH, quando
+    configurada).
 
-## 2) Entrada da mensagem: API/UI → contexto
+------------------------------------------------------------------------
 
-Quando o usuário envia mensagem, o endpoint `python/api/message.py`:
+## 2) Entrada da mensagem: API/UI → Contexto
 
-1. normaliza payload (JSON ou multipart);
-2. salva anexos enviados e gera caminhos internos;
-3. resolve o contexto com `ApiHandler.use_context()` (reusa contexto existente ou cria novo com `initialize_agent()`);
-4. dispara extensões de `user_message_ui` para pré-processar texto/anexos;
-5. registra a mensagem no log/queue do frontend;
-6. chama `context.communicate(UserMessage(...))`.
+Quando o usuário envia uma mensagem, o endpoint `python/api/message.py`:
+
+1.  normaliza o payload (JSON ou multipart);
+2.  salva anexos e gera caminhos internos;
+3.  resolve o contexto via `ApiHandler.use_context()`;
+4.  dispara extensões `user_message_ui`;
+5.  registra a mensagem no log/queue do frontend;
+6.  chama `context.communicate(UserMessage(...))`.
+
+------------------------------------------------------------------------
 
 ## 3) Gestão de contexto e tarefa assíncrona
 
-`AgentContext` é o “container” da conversa. Ele mantém:
+`AgentContext` mantém:
 
-- `id`, timestamps e metadados da sessão;
-- `agent0` (instância principal do agente);
-- referência de task em execução (`DeferredTask`);
-- estado de pausa/intervenção e stream atual;
-- log incremental para UI.
+-   id, timestamps e metadados da sessão;
+-   instância principal do agente (`agent0`);
+-   referência da task (`DeferredTask`);
+-   estado de pausa/intervenção;
+-   stream atual;
+-   log incremental para UI.
 
-Ao receber mensagem, `communicate()` faz:
+------------------------------------------------------------------------
 
-- se já existe task rodando: transforma nova entrada em **intervenção** (broadcast para agente atual/superiores);
-- se não existe task: inicia `_process_chain()` em thread assíncrona via `DeferredTask`.
+## 4) Cadeia de processamento (\_process_chain)
 
-## 4) Cadeia de processamento (`_process_chain`)
+1.  adiciona mensagem ao histórico;
+2.  chama `agent.monologue()`;
+3.  encaminha resultado ao agente superior (quando aplicável);
+4.  executa extensões `process_chain_end`.
 
-A cadeia de processamento encapsula o ciclo de alto nível:
+------------------------------------------------------------------------
 
-1. adiciona mensagem do usuário ao histórico (`hist_add_user_message`);
-2. chama `agent.monologue()` para executar o loop de raciocínio/ação;
-3. se houver agente superior na hierarquia, encaminha o resultado como retorno de ferramenta (`call_subordinate`) para esse superior;
-4. ao final, executa extensões de `process_chain_end` (ex.: processamento de fila).
+## 5) Ciclo principal (monologue)
 
-Isso permite suporte nativo ao modelo hierárquico multiagente, onde um agente subordinado retorna saída para o seu superior até chegar ao topo.
+Fluxo:
 
-## 5) Ciclo principal do agente (`monologue`)
+1.  inicializa `LoopData`;
+2.  executa `monologue_start`;
+3.  inicia loop de iteração;
+4.  executa `message_loop_start`;
+5.  monta prompt;
+6.  chama modelo com streaming;
+7.  salva resposta;
+8.  processa ferramentas;
+9.  encerra se `break_loop=True`;
+10. executa `message_loop_end`;
+11. executa `monologue_end`.
 
-`Agent.monologue()` executa em loop contínuo com tratamento de intervenção e retry:
+------------------------------------------------------------------------
 
-1. inicializa `LoopData` da iteração;
-2. executa extensões `monologue_start`;
-3. entra no loop interno de mensagens, incrementando `iteration`;
-4. executa extensões `message_loop_start`;
-5. monta prompt com `prepare_prompt()`;
-6. executa extensões `before_main_llm_call`;
-7. chama o modelo (`call_chat_model`) com callbacks de streaming;
-8. salva resposta no histórico;
-9. tenta extrair chamada de ferramenta (`process_tools`);
-10. se a ferramenta retornar `break_loop=True` (como `response`), encerra e devolve resposta final;
-11. executa extensões `message_loop_end`;
-12. ao sair, executa `monologue_end`.
+## 6) Montagem de Prompt
 
-Erros reparáveis viram mensagens de warning para o próprio LLM tentar corrigir. Erros críticos passam por retry controlado e, se persistirem, encerram a execução.
+Composição:
 
-## 6) Montagem de prompt e contexto dinâmico
+-   System prompt;
+-   Histórico formatado;
+-   Extras dinâmicos (memória, skills, metadados).
 
-`prepare_prompt()` combina três blocos:
+------------------------------------------------------------------------
 
-1. **System prompt** (`get_system_prompt`) vindo de extensões `system_prompt`;
-2. **Histórico** convertido para formato do modelo;
-3. **Extras** temporários/persistentes (memórias, skills carregadas, metadados).
+## 7) Execução de Ferramentas
 
-A ordem dos hooks permite composição incremental. Exemplo típico:
+1.  Parse JSON para identificar tool;
+2.  Resolve MCP ou ferramenta local;
+3.  Executa hooks before/after;
+4.  Finaliza se necessário.
 
-- `system_prompt/_10_system_prompt.py` injeta prompt base, ferramentas, MCP, skills disponíveis, segredos e contexto de projeto;
-- `system_prompt/_20_behaviour_prompt.py` injeta regras dinâmicas de comportamento (`behaviour.md`);
-- `message_loop_prompts_after/*` injeta memória recuperada, skills carregadas, data/hora, informações de agente e outros extras.
+Tool finalizadora padrão: `response`.
 
-O prompt final também é salvo como “janela de contexto atual” com contagem aproximada de tokens.
+------------------------------------------------------------------------
 
-## 7) Execução de ferramentas (tools)
+## 8) Extensões
 
-Após resposta do LLM, `process_tools()`:
+Sistema baseado em:
 
-1. parseia JSON “sujo” para identificar `tool_name` e `tool_args`;
-2. tenta resolver ferramenta MCP;
-3. se não houver MCP, faz fallback para ferramenta local via `get_tool()` (carregamento dinâmico por perfil/agente);
-4. executa hooks:
-   - `tool.before_execution()`
-   - extensões `tool_execute_before`
-   - `tool.execute()`
-   - extensões `tool_execute_after`
-   - `tool.after_execution()`
-5. se a resposta da ferramenta sinaliza `break_loop`, retorna mensagem final.
+-   múltiplos paths;
+-   override por precedência;
+-   ordem lexical (*10*, *20*, *90*).
 
-A ferramenta `response` (`python/tools/response.py`) é a finalizadora padrão: devolve texto ao usuário e encerra o loop.
+------------------------------------------------------------------------
 
-## 8) Extensões: “backbone” de customização
+## 9) Persistência e Continuidade
 
-O mecanismo `call_extensions()`:
+-   Compressão assíncrona de histórico;
+-   Persistência de chat;
+-   Processamento de fila.
 
-- localiza extensões em múltiplos paths (default + overrides por perfil/projeto/usuário);
-- aplica deduplicação por nome de arquivo (primeiro encontrado vence, habilitando override);
-- executa extensões em ordem lexical do arquivo (prefixos `_10_`, `_20_` etc. controlam sequência).
+------------------------------------------------------------------------
 
-Com isso, quase todo comportamento do agente é plugável sem alterar o núcleo.
-
-## 9) Persistência, compressão e continuidade
-
-Ao final das iterações:
-
-- `message_loop_end/_10_organize_history.py` dispara compressão assíncrona do histórico;
-- `message_loop_end/_90_save_chat.py` persiste chat temporário (exceto contexto BACKGROUND);
-- `process_chain_end/_50_process_queue.py` despacha próxima mensagem enfileirada, permitindo “fila de prompts”.
-
-Esse desenho sustenta conversas longas com compressão incremental de contexto e continuidade entre mensagens.
-
-## 10) Resumo do fluxo em sequência
-
-1. UI/API recebe mensagem.
-2. Handler resolve/cria contexto.
-3. Mensagem entra no histórico.
-4. `monologue` inicia iteração.
-5. Prompt é montado (system + history + extras).
-6. LLM responde em stream.
-7. Agente executa ferramenta pedida.
-8. Ferramentas/Extensões atualizam logs, estado e memória.
-9. Ferramenta `response` encerra loop com resposta final.
-10. Histórico é comprimido/persistido e fila é processada.
-
-## 11) Pontos de extensão mais importantes para evoluir o fluxo
-
-- `python/extensions/system_prompt/*`: altera instruções base e contexto sistêmico.
-- `python/extensions/message_loop_prompts_after/*`: injeta memória/skills/projeto por iteração.
-- `python/extensions/tool_execute_before|after/*`: intercepta argumentos/retornos de tools.
-- `agents/<perfil>/prompts`, `agents/<perfil>/tools`, `agents/<perfil>/extensions`: customização por perfil sem fork do core.
-
----
-
-Se você quiser, o próximo passo pode ser um **diagrama de sequência (mermaid)** com esse fluxo (UI → API → AgentContext → Monologue → Tool → Response), incluindo os pontos de extensão por etapa.
+Documento gerado automaticamente em: 2026-02-13T11:19:36.056764 UTC
