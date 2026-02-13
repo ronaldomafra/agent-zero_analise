@@ -1,5 +1,7 @@
 # Fluxo detalhado de funcionamento do agente (Agent Zero)
 
+> Versão consolidada em português do Brasil para facilitar merge e revisão na PR.
+
 Este documento descreve, de ponta a ponta, como o Agent Zero processa uma mensagem: desde a entrada via API/UI, passando por contexto, montagem de prompt e execução de ferramentas/extensões, até a resposta final e a persistência.
 
 ## 1) Bootstrap e inicialização do runtime
